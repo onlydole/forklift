@@ -1,7 +1,8 @@
 use clap::Parser;
 use dotenv::dotenv;
 use octocrab::{models::Repository, Octocrab, Page};
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet, sync::Semaphore, time::{sleep, Duration}};
+use http::StatusCode;
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
@@ -87,19 +88,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(total_pages) = current_page.number_of_pages() {
         let mut tasks = JoinSet::new();
+        let semaphore = std::sync::Arc::new(Semaphore::new(5));
         for page in 2..=total_pages {
             let octo = octocrab.clone();
             let owner = owner.clone();
             let repo = repo.clone();
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
             tasks.spawn(async move {
-                let mut page = octo
-                    .repos(&owner, &repo)
-                    .list_forks()
-                    .per_page(100)
-                    .page(page)
-                    .send()
-                    .await?;
-                Ok::<_, octocrab::Error>(page.take_items())
+                let _permit = permit;
+                fetch_page_with_retry(octo, owner, repo, page).await
             });
         }
 
@@ -179,4 +176,43 @@ fn parse_github_url(raw_url: &str) -> Result<RepoInfo, ForkliftError> {
     let name = segments[1].clone();
 
     Ok(RepoInfo { owner, name })
+}
+
+/// Fetch a single fork page and retry if GitHub's secondary rate limit is hit.
+async fn fetch_page_with_retry(
+    octocrab: Octocrab,
+    owner: String,
+    repo: String,
+    page: u32,
+) -> Result<Vec<Repository>, octocrab::Error> {
+    let mut attempts = 0;
+    loop {
+        match octocrab
+            .repos(&owner, &repo)
+            .list_forks()
+            .per_page(100)
+            .page(page)
+            .send()
+            .await
+        {
+            Ok(mut p) => return Ok(p.take_items()),
+            Err(err) => {
+                let retry = match &err {
+                    octocrab::Error::GitHub { source, .. } => {
+                        source.status_code == StatusCode::FORBIDDEN
+                            && source.message.to_ascii_lowercase().contains("rate limit")
+                            && attempts < 5
+                    }
+                    _ => false,
+                };
+                if retry {
+                    attempts += 1;
+                    let wait = 2u64.pow(attempts) * 5;
+                    sleep(Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
 }
