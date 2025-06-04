@@ -1,6 +1,6 @@
 # Forklift
 
-A Rust CLI tool that analyzes and reports on organization-owned forks of public GitHub repositories.
+A Rust CLI tool that analyzes and reports on organization-owned forks of public GitHub repositories. The project started as a personal experiment, but contributions from the community are always welcome.
 
 ## Features
 
@@ -22,14 +22,14 @@ A Rust CLI tool that analyzes and reports on organization-owned forks of public 
 Clone the repository:
 
 ```shell
-git clone https://github.com/yourusername/forklift.git
+git clone https://github.com/onlydole/forklift.git
 cd forklift
 ```
 
 Build the project:
 
 ```shell
-cargo build --release
+cargo build --path .
 ```
 
 The compiled binary will be available at `target/release/forklift`.
@@ -113,4 +113,4 @@ Forklift provides clear error messages for common issues:
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on submitting changes.
