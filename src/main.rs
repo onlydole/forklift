@@ -1,10 +1,10 @@
 use clap::Parser;
 use dotenv::dotenv;
 use octocrab::{models::Repository, Octocrab, Page};
+use tokio::task::JoinSet;
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
-use std::mem;
 use thiserror::Error;
 use url::Url;
 
@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Fetch all pages of forks
     let mut all_forks: Vec<Repository> = Vec::new();
 
-    // First page
+    // Fetch first page and capture total page count
     let mut current_page: Page<Repository> = octocrab
         .repos(&owner, &repo)
         .list_forks()
@@ -83,18 +83,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .send()
         .await?;
 
-    let first_items = mem::take(&mut current_page.items);
-    all_forks.extend(first_items);
+    all_forks.extend(current_page.take_items());
 
-    // Keep fetching while there's a 'next' page
-    while current_page.next.is_some() {
-        let next_page = octocrab.get_page(&current_page.next).await?;
-        if let Some(mut page) = next_page {
-            let items = mem::take(&mut page.items);
+    if let Some(total_pages) = current_page.number_of_pages() {
+        let mut tasks = JoinSet::new();
+        for page in 2..=total_pages {
+            let octo = octocrab.clone();
+            let owner = owner.clone();
+            let repo = repo.clone();
+            tasks.spawn(async move {
+                let mut page = octo
+                    .repos(&owner, &repo)
+                    .list_forks()
+                    .per_page(100)
+                    .page(page)
+                    .send()
+                    .await?;
+                Ok::<_, octocrab::Error>(page.take_items())
+            });
+        }
+
+        while let Some(res) = tasks.join_next().await {
+            let items = res??;
             all_forks.extend(items);
-            current_page = page;
-        } else {
-            break;
         }
     }
 
