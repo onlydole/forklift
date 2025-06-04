@@ -1,10 +1,11 @@
 use clap::Parser;
 use dotenv::dotenv;
 use octocrab::{models::Repository, Octocrab, Page};
+use tokio::{task::JoinSet, sync::Semaphore, time::{sleep, Duration}};
+use http::StatusCode;
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
-use std::mem;
 use thiserror::Error;
 use url::Url;
 
@@ -75,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Fetch all pages of forks
     let mut all_forks: Vec<Repository> = Vec::new();
 
-    // First page
+    // Fetch first page and capture total page count
     let mut current_page: Page<Repository> = octocrab
         .repos(&owner, &repo)
         .list_forks()
@@ -83,18 +84,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .send()
         .await?;
 
-    let first_items = mem::take(&mut current_page.items);
-    all_forks.extend(first_items);
+    all_forks.extend(current_page.take_items());
 
-    // Keep fetching while there's a 'next' page
-    while current_page.next.is_some() {
-        let next_page = octocrab.get_page(&current_page.next).await?;
-        if let Some(mut page) = next_page {
-            let items = mem::take(&mut page.items);
+    if let Some(total_pages) = current_page.number_of_pages() {
+        let mut tasks = JoinSet::new();
+        let semaphore = std::sync::Arc::new(Semaphore::new(5));
+        for page in 2..=total_pages {
+            let octo = octocrab.clone();
+            let owner = owner.clone();
+            let repo = repo.clone();
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            tasks.spawn(async move {
+                let _permit = permit;
+                fetch_page_with_retry(octo, owner, repo, page).await
+            });
+        }
+
+        while let Some(res) = tasks.join_next().await {
+            let items = res??;
             all_forks.extend(items);
-            current_page = page;
-        } else {
-            break;
         }
     }
 
@@ -168,4 +176,43 @@ fn parse_github_url(raw_url: &str) -> Result<RepoInfo, ForkliftError> {
     let name = segments[1].clone();
 
     Ok(RepoInfo { owner, name })
+}
+
+/// Fetch a single fork page and retry if GitHub's secondary rate limit is hit.
+async fn fetch_page_with_retry(
+    octocrab: Octocrab,
+    owner: String,
+    repo: String,
+    page: u32,
+) -> Result<Vec<Repository>, octocrab::Error> {
+    let mut attempts = 0;
+    loop {
+        match octocrab
+            .repos(&owner, &repo)
+            .list_forks()
+            .per_page(100)
+            .page(page)
+            .send()
+            .await
+        {
+            Ok(mut p) => return Ok(p.take_items()),
+            Err(err) => {
+                let retry = match &err {
+                    octocrab::Error::GitHub { source, .. } => {
+                        source.status_code == StatusCode::FORBIDDEN
+                            && source.message.to_ascii_lowercase().contains("rate limit")
+                            && attempts < 5
+                    }
+                    _ => false,
+                };
+                if retry {
+                    attempts += 1;
+                    let wait = 2u64.pow(attempts) * 5;
+                    sleep(Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
 }
