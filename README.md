@@ -9,6 +9,11 @@ A Rust CLI tool that analyzes and reports on organization-owned forks of public 
 - Supports authentication via environment variables or CLI arguments
 - Handles pagination automatically to fetch all forks
 - Customizable output file location
+- **Parallel fork retrieval** with configurable concurrency for optimal performance
+- **Real-time progress tracking** with visual progress bars
+- **Structured logging** with adjustable verbosity levels
+- **Intelligent retry logic** with exponential backoff for rate limits
+- **Async I/O** for improved performance
 
 ## Installation
 
@@ -52,6 +57,18 @@ Custom output location:
 
 ```shell
 forklift --output custom_report.md https://github.com/kubernetes/kubernetes
+```
+
+With verbose logging:
+
+```shell
+forklift --verbose https://github.com/kubernetes/kubernetes
+```
+
+Custom concurrency (default: 10):
+
+```shell
+forklift --concurrency 20 https://github.com/kubernetes/kubernetes
 ```
 
 ### Authentication
@@ -105,11 +122,31 @@ Forklift provides clear error messages for common issues:
 ## Dependencies
 
 - `octocrab`: GitHub API client for Rust
-- `tokio`: Async runtime
+- `tokio`: Async runtime with async I/O support
 - `clap`: Command-line argument parsing
 - `dotenv`: Environment variable management
 - `url`: URL parsing
 - `thiserror`: Error handling
+- `tracing` / `tracing-subscriber`: Structured logging
+- `indicatif`: Progress bars and spinners
+
+## Performance Optimizations
+
+Forklift is designed for speed and efficiency:
+
+- **Parallel API requests**: Fetches multiple pages simultaneously with configurable concurrency (default: 10 concurrent requests)
+- **Smart retry logic**: Handles GitHub rate limits gracefully with exponential backoff (2s, 4s, 8s)
+- **Async I/O**: Non-blocking file operations for better performance
+- **Progress feedback**: Real-time progress bars show fetch status without impacting performance
+- **Structured logging**: Low-overhead logging that only shows what you need
+
+## CI/CD
+
+This project includes comprehensive GitHub Actions workflows:
+
+- **CI**: Multi-platform builds and tests (Linux, macOS, Windows) on stable and beta Rust
+- **Release**: Automated binary releases for multiple platforms (x86_64 and ARM64)
+- **Security**: Daily security audits and dependency reviews
 
 ## Contributing
 

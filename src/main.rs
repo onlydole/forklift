@@ -1,12 +1,20 @@
 use clap::Parser;
 use dotenv::dotenv;
-use octocrab::{models::Repository, Octocrab, Page};
-use tokio::{task::JoinSet, sync::Semaphore, time::{sleep, Duration}};
 use http::StatusCode;
+use indicatif::{ProgressBar, ProgressStyle};
+use octocrab::{models::Repository, Octocrab, Page};
 use std::env;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::{
+    io::AsyncWriteExt,
+    sync::Semaphore,
+    task::JoinSet,
+    time::{sleep, Duration},
+};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -26,6 +34,14 @@ struct Args {
     /// Override output filename (default: "reports/<repo>_forks.md")
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Number of concurrent requests (default: 10)
+    #[arg(short, long, default_value = "10")]
+    concurrency: usize,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Error)]
@@ -44,6 +60,9 @@ enum ForkliftError {
 
     #[error(transparent)]
     OctocrabError(#[from] octocrab::Error),
+
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
 }
 
 /// Holds the extracted repository info
@@ -55,28 +74,38 @@ struct RepoInfo {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Parse CLI arguments
+    // Parse CLI arguments first to check for verbose flag
     let args = Args::parse();
 
-    // 2. Load .env if present (this will populate the environment)
+    // Initialize tracing
+    let log_level = if args.verbose { "debug" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+        )
+        .with_target(false)
+        .compact()
+        .init();
+
+    // Load .env if present
     dotenv().ok();
 
-    // 3. Determine final GitHub token (priority: CLI token > .env/env variable)
+    // Determine final GitHub token
     let github_token = match args.token {
         Some(cli_token) => cli_token,
         None => env::var("GITHUB_TOKEN").map_err(|_| ForkliftError::MissingGithubToken)?,
     };
 
-    // 4. Parse the provided GitHub URL to extract (owner, repo)
+    // Parse the provided GitHub URL
     let RepoInfo { owner, name: repo } = parse_github_url(&args.repo_url)?;
+    info!("Analyzing forks for {}/{}", owner, repo);
 
-    // 5. Build an Octocrab client
+    // Build an Octocrab client
     let octocrab = Octocrab::builder().personal_token(github_token).build()?;
 
-    // 6. Fetch all pages of forks
-    let mut all_forks: Vec<Repository> = Vec::new();
-
-    // Fetch first page and capture total page count
+    // Fetch first page to determine total pages
+    debug!("Fetching initial page to determine fork count");
     let mut current_page: Page<Repository> = octocrab
         .repos(&owner, &repo)
         .list_forks()
@@ -84,59 +113,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .send()
         .await?;
 
+    let mut all_forks: Vec<Repository> = Vec::new();
     all_forks.extend(current_page.take_items());
 
+    // Process remaining pages in parallel if there are more
     if let Some(total_pages) = current_page.number_of_pages() {
+        info!("Found {} pages of forks to fetch", total_pages);
+
+        // Create progress bar
+        let progress = ProgressBar::new(total_pages as u64 - 1);
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} pages ({eta})")
+                .expect("Invalid progress bar template")
+                .progress_chars("#>-")
+        );
+
         let mut tasks = JoinSet::new();
-        let semaphore = std::sync::Arc::new(Semaphore::new(5));
+        let semaphore = Arc::new(Semaphore::new(args.concurrency));
+        let completed = Arc::new(AtomicUsize::new(0));
+
         for page in 2..=total_pages {
             let octo = octocrab.clone();
-            let owner = owner.clone();
-            let repo = repo.clone();
+            let owner_clone = owner.clone();
+            let repo_clone = repo.clone();
             let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let completed_clone = completed.clone();
+            let progress_clone = progress.clone();
+
             tasks.spawn(async move {
                 let _permit = permit;
-                fetch_page_with_retry(octo, owner, repo, page).await
+                let result = fetch_page_with_retry(octo, owner_clone, repo_clone, page).await;
+
+                // Update progress
+                let count = completed_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                progress_clone.set_position(count as u64);
+
+                result
             });
         }
 
+        // Collect results as they come in
         while let Some(res) = tasks.join_next().await {
-            let items = res??;
-            all_forks.extend(items);
+            match res {
+                Ok(Ok(items)) => {
+                    debug!("Fetched {} forks from page", items.len());
+                    all_forks.extend(items);
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to fetch page: {}", e);
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    error!("Task join error: {}", e);
+                    return Err(e.into());
+                }
+            }
         }
+
+        progress.finish_with_message("All pages fetched");
+    } else {
+        info!("Only one page of forks found");
     }
 
-    // 7. Determine the final output path
-    // If user gave an --output, use that; otherwise default to "reports/<repo>_forks.md"
+    // Filter organization forks
+    let org_forks: Vec<_> = all_forks
+        .into_iter()
+        .filter_map(|fork| {
+            fork.owner.and_then(|owner| {
+                if owner.r#type.eq("Organization") {
+                    Some((
+                        owner.login,
+                        fork.name,
+                        fork.html_url.map(|u| u.to_string()).unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    info!("Found {} organization-owned forks", org_forks.len());
+
+    // Determine output path
     let final_output = if let Some(path) = args.output {
         path
     } else {
-        // Ensure "reports" dir exists
         fs::create_dir_all("reports")?;
         format!("reports/{}_forks.md", repo)
     };
 
-    // 8. Write results to the chosen Markdown file
-    let mut file = File::create(&final_output)?;
+    // Write results asynchronously
+    debug!("Writing results to {}", final_output);
+    write_results(&final_output, &owner, &repo, &org_forks).await?;
 
-    writeln!(file, "# Organization-owned forks for {}/{}", owner, repo)?;
-    writeln!(file)?;
-    writeln!(file, "| Organization | Fork Name | URL |")?;
-    writeln!(file, "|--------------|----------|-----|")?;
-
-    for fork in all_forks {
-        if let Some(fork_owner) = fork.owner {
-            if fork_owner.r#type.eq("Organization") {
-                let org_name = fork_owner.login;
-                let fork_name = fork.name;
-                let fork_url = fork.html_url.map(|u| u.to_string()).unwrap_or_default();
-
-                writeln!(file, "| {} | {} | {} |", org_name, fork_name, fork_url)?;
-            }
-        }
-    }
-
-    println!("Analysis completed. Results written to: {}", final_output);
+    info!("✓ Analysis completed. Results written to: {}", final_output);
     Ok(())
 }
 
@@ -186,6 +258,8 @@ async fn fetch_page_with_retry(
     page: u32,
 ) -> Result<Vec<Repository>, octocrab::Error> {
     let mut attempts = 0;
+    const MAX_RETRIES: u32 = 3;
+
     loop {
         match octocrab
             .repos(&owner, &repo)
@@ -195,24 +269,64 @@ async fn fetch_page_with_retry(
             .send()
             .await
         {
-            Ok(mut p) => return Ok(p.take_items()),
+            Ok(mut p) => {
+                if attempts > 0 {
+                    debug!(
+                        "Successfully fetched page {} after {} retries",
+                        page, attempts
+                    );
+                }
+                return Ok(p.take_items());
+            }
             Err(err) => {
-                let retry = match &err {
+                let should_retry = match &err {
                     octocrab::Error::GitHub { source, .. } => {
                         source.status_code == StatusCode::FORBIDDEN
                             && source.message.to_ascii_lowercase().contains("rate limit")
-                            && attempts < 5
+                            && attempts < MAX_RETRIES
                     }
                     _ => false,
                 };
-                if retry {
+
+                if should_retry {
                     attempts += 1;
-                    let wait = 2u64.pow(attempts) * 5;
+                    // More reasonable exponential backoff: 2s, 4s, 8s
+                    let wait = 2u64.pow(attempts);
+                    warn!(
+                        "Rate limit hit on page {}, retrying in {}s (attempt {}/{})",
+                        page, wait, attempts, MAX_RETRIES
+                    );
                     sleep(Duration::from_secs(wait)).await;
                     continue;
                 }
+
                 return Err(err);
             }
         }
     }
+}
+
+/// Write results to markdown file asynchronously
+async fn write_results(
+    path: &str,
+    owner: &str,
+    repo: &str,
+    forks: &[(String, String, String)],
+) -> Result<(), std::io::Error> {
+    let mut file = tokio::fs::File::create(path).await?;
+
+    file.write_all(format!("# Organization-owned forks for {}/{}\n\n", owner, repo).as_bytes())
+        .await?;
+    file.write_all(b"| Organization | Fork Name | URL |\n")
+        .await?;
+    file.write_all(b"|--------------|----------|-----|\n")
+        .await?;
+
+    for (org_name, fork_name, fork_url) in forks {
+        file.write_all(format!("| {} | {} | {} |\n", org_name, fork_name, fork_url).as_bytes())
+            .await?;
+    }
+
+    file.flush().await?;
+    Ok(())
 }
