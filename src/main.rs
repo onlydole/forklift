@@ -1,5 +1,5 @@
 use clap::Parser;
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use http::StatusCode;
 use indicatif::{ProgressBar, ProgressStyle};
 use octocrab::{models::Repository, Octocrab, Page};
