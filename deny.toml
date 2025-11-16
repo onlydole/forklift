@@ -12,7 +12,7 @@ ignore = []
 
 [licenses]
 version = 2
-# CNCF/Linux Foundation approved licenses
+# Only allow CNCF/Linux Foundation approved licenses
 allow = [
     # Primary OSS licenses
     "MIT",
@@ -36,21 +36,12 @@ allow = [
     "Unicode-3.0",
 ]
 
-# Deny any license not explicitly allowed
-deny = []
-
 confidence-threshold = 0.8
-
-# Require explicit approval for new licenses
-copyleft = "deny"
 
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
-
-# Deny known problematic licenses
-deny = []
 
 [sources]
 unknown-registry = "warn"
