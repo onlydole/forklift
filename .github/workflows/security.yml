@@ -19,14 +19,29 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo-binstall
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-binstall
+          key: ${{ runner.os }}-cargo-binstall
+
+      - name: Install cargo-binstall
+        run: |
+          if ! command -v cargo-binstall &> /dev/null; then
+            curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          fi
+
       - name: Cache cargo-audit
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cargo-audit
-          key: ${{ runner.os }}-cargo-audit
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('~/.cargo/bin/cargo-audit') }}
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --force
+        run: |
+          if ! command -v cargo-audit &> /dev/null; then
+            cargo binstall --no-confirm cargo-audit
+          fi
 
       - name: Run security audit
         run: cargo audit
@@ -50,8 +65,29 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo-binstall
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-binstall
+          key: ${{ runner.os }}-cargo-binstall
+
+      - name: Install cargo-binstall
+        run: |
+          if ! command -v cargo-binstall &> /dev/null; then
+            curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          fi
+
+      - name: Cache cargo-deny
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: ${{ runner.os }}-cargo-deny-${{ hashFiles('~/.cargo/bin/cargo-deny') }}
+
       - name: Install cargo-deny
-        run: cargo install cargo-deny
+        run: |
+          if ! command -v cargo-deny &> /dev/null; then
+            cargo binstall --no-confirm cargo-deny
+          fi
 
       - name: Check licenses, bans, advisories, and sources
         run: cargo deny check
