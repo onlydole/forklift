@@ -330,3 +330,75 @@ async fn write_results(
     file.flush().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_github_url, write_results, ForkliftError};
+    use tempfile::tempdir;
+    use tokio::fs;
+
+    #[test]
+    fn parse_github_url_supports_http_and_https() {
+        let https = parse_github_url("https://github.com/onlydole/forklift").unwrap();
+        assert_eq!(https.owner, "onlydole");
+        assert_eq!(https.name, "forklift");
+
+        let http = parse_github_url("http://github.com/onlydole/forklift").unwrap();
+        assert_eq!(http.owner, "onlydole");
+        assert_eq!(http.name, "forklift");
+    }
+
+    #[test]
+    fn parse_github_url_infers_missing_scheme() {
+        let info = parse_github_url("github.com/rust-lang/rust").unwrap();
+
+        assert_eq!(info.owner, "rust-lang");
+        assert_eq!(info.name, "rust");
+    }
+
+    #[test]
+    fn parse_github_url_rejects_invalid_input() {
+        let invalid_domain = parse_github_url("https://example.com/owner/repo");
+        assert!(matches!(
+            invalid_domain,
+            Err(ForkliftError::InvalidDomain(domain)) if domain == "example.com"
+        ));
+
+        let missing_segments = parse_github_url("https://github.com/onlydole");
+        assert!(matches!(missing_segments, Err(ForkliftError::InvalidPathSegments(_))));
+    }
+
+    #[tokio::test]
+    async fn write_results_generates_markdown_table() {
+        let temp_dir = tempdir().expect("tempdir to be created");
+        let output_path = temp_dir.path().join("report.md");
+        let forks = vec![
+            (
+                "org-one".to_string(),
+                "fork-one".to_string(),
+                "https://github.com/org-one/fork-one".to_string(),
+            ),
+            (
+                "org-two".to_string(),
+                "fork-two".to_string(),
+                "https://github.com/org-two/fork-two".to_string(),
+            ),
+        ];
+
+        write_results(
+            output_path.to_str().unwrap(),
+            "owner",
+            "repo",
+            &forks,
+        )
+        .await
+        .expect("write_results to succeed");
+
+        let contents = fs::read_to_string(&output_path).await.unwrap();
+
+        assert!(contents.contains("# Organization-owned forks for owner/repo"));
+        assert!(contents.contains("| Organization | Fork Name | URL |"));
+        assert!(contents.contains("| org-one | fork-one | https://github.com/org-one/fork-one |"));
+        assert!(contents.contains("| org-two | fork-two | https://github.com/org-two/fork-two |"));
+    }
+}
